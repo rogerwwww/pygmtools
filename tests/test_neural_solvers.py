@@ -16,13 +16,38 @@ import numpy as np
 import torch
 import functools
 import itertools
+import importlib
 from tqdm import tqdm
 
 from test_utils import *
 
 import platform
 os_name = platform.system()
-backends = ['pytorch', 'numpy', 'jittor', 'paddle'] if os_name == 'Linux' else ['pytorch', 'numpy', 'paddle']
+backends = ['pytorch', 'numpy', 'jittor', 'paddle', 'tensorflow', 'mindspore'] if os_name == 'Linux' else \
+    ['pytorch', 'numpy', 'paddle', 'tensorflow', 'mindspore']
+
+
+def _filter_available_backends(backends):
+    available = []
+    for backend in backends:
+        if backend in ['pytorch', 'numpy']:
+            available.append(backend)
+            continue
+        try:
+            importlib.import_module(f'pygmtools.{backend}_backend')
+            if backend == 'tensorflow':
+                import tensorflow as tf
+                _ = tf.convert_to_tensor([0.], dtype=tf.float32)
+            elif backend == 'mindspore':
+                import mindspore
+                _ = mindspore.Tensor([0.], dtype=mindspore.float32)
+            available.append(backend)
+        except Exception as e:
+            print(f'[warning] skip unavailable backend "{backend}": {repr(e)}')
+    return available
+
+
+backends = _filter_available_backends(backends)
 
 
 # The testing function for quadratic assignment

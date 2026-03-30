@@ -11,10 +11,16 @@
 import tensorflow as tf
 import tensorflow.experimental.numpy as tnp
 import numpy as np
+import os
+import math
+import itertools
+import functools
 from multiprocessing import Pool
 
 import pygmtools.utils
 from pygmtools.numpy_backend import _hung_kernel
+from pygmtools.tensorflow_modules import WeightedInnerProdAffinity, Linear, Siamese_Gconv, \
+    Siamese_ChannelIndependentConv, NGMConvLayer
 
 
 #############################################
@@ -344,6 +350,477 @@ def _check_and_init_gm(K, n1, n2, n1max, n2max, x0):
     v0 = tf.reshape(tf.transpose(x0, perm=[0, 2, 1]), [batch_num, n1n2, 1])
 
     return batch_num, n1, n2, n1max, n2max, n1n2, v0
+
+
+def _get_single_pc_opt(X, i, j, Xij=None):
+    m, _, n, _ = X.shape
+    if Xij is None:
+        Xij = X[i, j]
+    X_combo = tf.matmul(X[i, :], X[:, j])
+    pair_con = 1 - tf.reduce_sum(tf.abs(Xij - X_combo)) / tf.cast(2 * n * m, X.dtype)
+    return pair_con
+
+
+def _get_batch_pc_opt(X):
+    m = X.shape[0]
+    n = X.shape[2]
+    X1 = tf.reshape(tf.tile(tf.reshape(X, (m, 1, m, n, n)), (1, m, 1, 1, 1)), (-1, n, n))
+    X2 = tf.reshape(tf.transpose(tf.tile(tf.reshape(X, (1, m, m, n, n)), (m, 1, 1, 1, 1)), perm=[0, 2, 1, 3, 4]), (-1, n, n))
+    X_combo = tf.reshape(tf.matmul(X1, X2), (m, m, m, n, n))
+    X_ori = tf.tile(tf.reshape(X, (m, m, 1, n, n)), (1, 1, m, 1, 1))
+    return 1 - tf.reduce_sum(tf.abs(X_combo - X_ori), axis=(2, 3, 4)) / tf.cast(2 * n * m, X.dtype)
+
+
+def cao_solver(K, X, num_graph, num_node, max_iter, lambda_init, lambda_step, lambda_max, iter_boost):
+    m, n = num_graph, num_node
+    param_lambda = lambda_init
+
+    def _comp_aff_score(x, k):
+        return tf.reshape(compute_affinity_score(tf.reshape(x, (-1, n, n)), tf.reshape(k, (-1, n * n, n * n))), x.shape[:-2])
+
+    for iter_idx in range(max_iter):
+        if iter_idx >= iter_boost:
+            param_lambda = min(param_lambda * lambda_step, lambda_max)
+        pair_aff = tf.reshape(_comp_aff_score(X, K), (m, m))
+        pair_aff = pair_aff - tf.eye(m, dtype=pair_aff.dtype) * pair_aff
+        norm = tf.reduce_max(pair_aff)
+        rows = []
+        for i in range(m):
+            row = []
+            for j in range(m):
+                if i >= j:
+                    row.append(X[i, j])
+                    continue
+                aff_ori = compute_affinity_score(X[i:i + 1, j], K[i:i + 1, j])[0] / norm
+                con_ori = _get_single_pc_opt(X, i, j)
+                score_ori = aff_ori if iter_idx < iter_boost else aff_ori * (1 - param_lambda) + con_ori * param_lambda
+                X_upt = X[i, j]
+                for k in range(m):
+                    X_combo = tf.matmul(X[i, k], X[k, j])
+                    aff_combo = compute_affinity_score(X_combo[None], K[i:i + 1, j])[0] / norm
+                    con_combo = _get_single_pc_opt(X, i, j, X_combo)
+                    score_combo = aff_combo if iter_idx < iter_boost else aff_combo * (1 - param_lambda) + con_combo * param_lambda
+                    if float(score_combo) > float(score_ori):
+                        X_upt, score_ori = X_combo, score_combo
+                row.append(X_upt)
+            rows.append(tf.stack(row, axis=0))
+        X = tf.stack(rows, axis=0)
+        upper = tf.linalg.band_part(tf.ones((m, m), dtype=X.dtype), 0, -1) - tf.eye(m, dtype=X.dtype)
+        lower = tf.transpose(upper)
+        X = X * upper[:, :, None, None] + tf.transpose(X, perm=[1, 0, 3, 2]) * lower[:, :, None, None] + X * tf.eye(m, dtype=X.dtype)[:, :, None, None]
+    return X
+
+
+def cao_fast_solver(K, X, num_graph, num_node, max_iter, lambda_init, lambda_step, lambda_max, iter_boost):
+    return cao_solver(K, X, num_graph, num_node, max_iter, lambda_init, lambda_step, lambda_max, iter_boost)
+
+
+def mgm_floyd_solver(K, X, num_graph, num_node, param_lambda):
+    m, n = num_graph, num_node
+    for k in range(m):
+        pair_aff = tf.reshape(compute_affinity_score(tf.reshape(X, (-1, n, n)), tf.reshape(K, (-1, n * n, n * n))), (m, m))
+        pair_aff = pair_aff - tf.eye(m, dtype=pair_aff.dtype) * pair_aff
+        norm = tf.reduce_max(pair_aff)
+        rows = []
+        for i in range(m):
+            row = []
+            for j in range(m):
+                if i >= j:
+                    row.append(X[i, j])
+                    continue
+                score_ori = compute_affinity_score(X[i:i + 1, j], K[i:i + 1, j])[0] / norm
+                X_combo = tf.matmul(X[i, k], X[k, j])
+                score_combo = compute_affinity_score(X_combo[None], K[i:i + 1, j])[0] / norm
+                row.append(X_combo if float(score_combo) > float(score_ori) else X[i, j])
+            rows.append(tf.stack(row, axis=0))
+        X = tf.stack(rows, axis=0)
+        X = tf.linalg.set_diag(X, tf.linalg.diag_part(X))
+        X = tf.where(tf.reshape(tf.range(m)[:, None] < tf.range(m)[None, :], (m, m, 1, 1)), X, tf.transpose(X, perm=[1, 0, 3, 2]))
+
+    for k in range(m):
+        pair_aff = tf.reshape(compute_affinity_score(tf.reshape(X, (-1, n, n)), tf.reshape(K, (-1, n * n, n * n))), (m, m))
+        pair_aff = pair_aff - tf.eye(m, dtype=pair_aff.dtype) * pair_aff
+        norm = tf.reduce_max(pair_aff)
+        rows = []
+        for i in range(m):
+            row = []
+            for j in range(m):
+                if i >= j:
+                    row.append(X[i, j])
+                    continue
+                aff_ori = compute_affinity_score(X[i:i + 1, j], K[i:i + 1, j])[0] / norm
+                con_ori = _get_single_pc_opt(X, i, j)
+                score_ori = aff_ori * (1 - param_lambda) + con_ori * param_lambda
+                X_combo = tf.matmul(X[i, k], X[k, j])
+                aff_combo = compute_affinity_score(X_combo[None], K[i:i + 1, j])[0] / norm
+                con_combo = _get_single_pc_opt(X, i, j, X_combo)
+                score_combo = aff_combo * (1 - param_lambda) + con_combo * param_lambda
+                row.append(X_combo if float(score_combo) > float(score_ori) else X[i, j])
+            rows.append(tf.stack(row, axis=0))
+        X = tf.stack(rows, axis=0)
+        X = tf.linalg.set_diag(X, tf.linalg.diag_part(X))
+        X = tf.where(tf.reshape(tf.range(m)[:, None] < tf.range(m)[None, :], (m, m, 1, 1)), X, tf.transpose(X, perm=[1, 0, 3, 2]))
+    return X
+
+
+def mgm_floyd_fast_solver(K, X, num_graph, num_node, param_lambda):
+    return mgm_floyd_solver(K, X, num_graph, num_node, param_lambda)
+
+
+def gamgm(A, W, ns, n_univ, U0, init_tau, min_tau, sk_gamma, sk_iter, max_iter, quad_weight,
+          converge_thresh, outlier_thresh, bb_smooth, verbose, cluster_M=None, projector='sinkhorn', hung_iter=True):
+    num_graphs = A.shape[0]
+    if ns is None:
+        ns = tf.fill((num_graphs,), A.shape[1])
+    ns_np = to_numpy(ns).astype('i4')
+    n_indices = np.cumsum(ns_np, axis=0)
+    supA = np.zeros((n_indices[-1], n_indices[-1]), dtype=np.float32)
+    A_np = to_numpy(A)
+    for i in range(num_graphs):
+        start_n = n_indices[i] - ns_np[i]
+        end_n = n_indices[i]
+        supA[start_n:end_n, start_n:end_n] = A_np[i, :ns_np[i], :ns_np[i]]
+    if isinstance(n_univ, tf.Tensor):
+        n_univ = int(to_numpy(n_univ).item())
+    elif n_univ is None:
+        n_univ = int(ns_np.max())
+    if U0 is None:
+        U0 = tf.convert_to_tensor(np.full((n_indices[-1], n_univ), 1 / n_univ, dtype=np.float32) + np.random.rand(n_indices[-1], n_univ).astype(np.float32) / 1000)
+    if cluster_M is None:
+        cluster_M = tf.ones((num_graphs, num_graphs), dtype=tf.float32)
+    supW = np.zeros((n_indices[-1], n_indices[-1]), dtype=np.float32)
+    W_np = to_numpy(W)
+    for i, j in itertools.product(range(num_graphs), repeat=2):
+        sx, ex = n_indices[i] - ns_np[i], n_indices[i]
+        sy, ey = n_indices[j] - ns_np[j], n_indices[j]
+        supW[sx:ex, sy:ey] = W_np[i, j, :ns_np[i], :ns_np[j]]
+    U = gamgm_real(tf.convert_to_tensor(supA), tf.convert_to_tensor(supW), tf.convert_to_tensor(ns_np), n_indices, n_univ,
+                   num_graphs, U0, init_tau, min_tau, sk_gamma, sk_iter, max_iter, quad_weight,
+                   converge_thresh, outlier_thresh, verbose, cluster_M, projector, hung_iter)
+    result = pygmtools.utils.MultiMatchingResult(True, 'tensorflow')
+    for i in range(num_graphs):
+        start_n = n_indices[i] - ns_np[i]
+        end_n = n_indices[i]
+        result[i] = U[start_n:end_n]
+    return result
+
+
+def gamgm_real(supA, supW, ns, n_indices, n_univ, num_graphs, U0, init_tau, min_tau, sk_gamma,
+               sk_iter, max_iter, quad_weight, converge_thresh, outlier_thresh, verbose,
+               cluster_M, projector, hung_iter):
+    U = U0
+    sinkhorn_tau = init_tau
+    cluster_weight = tf.convert_to_tensor(np.repeat(np.repeat(to_numpy(cluster_M), to_numpy(ns).astype('i4'), axis=0),
+                                                    to_numpy(ns).astype('i4'), axis=1), dtype=supA.dtype)
+    while True:
+        for i in range(max_iter):
+            UUt = tf.matmul(U, U, transpose_b=True)
+            lastUUt = UUt
+            quad = tf.matmul(tf.matmul(tf.matmul(supA, UUt * cluster_weight), supA), U) * quad_weight * 2
+            unary = tf.matmul(supW * cluster_weight, U)
+            V = (quad + unary) / num_graphs
+            if projector == 'hungarian':
+                U_list, n_start = [], 0
+                for n_end in n_indices:
+                    U_list.append(hungarian(V[n_start:n_end][None])[0, :, :n_univ])
+                    n_start = n_end
+            else:
+                V_list, n1, n_start = [], [], 0
+                for n_end in n_indices:
+                    V_list.append(V[n_start:n_end, :n_univ])
+                    n1.append(n_end - n_start)
+                    n_start = n_end
+                V_batch = build_batch(V_list)
+                U_batch = sinkhorn(V_batch, tf.convert_to_tensor(n1), max_iter=sk_iter, tau=sinkhorn_tau,
+                                   batched_operation=True, dummy_row=True)
+                U_list, n_start = [], 0
+                for idx, n_end in enumerate(n_indices):
+                    U_list.append(U_batch[idx, :n_end - n_start, :])
+                    n_start = n_end
+            U = tf.concat(U_list, axis=0)
+            if num_graphs == 2:
+                eye = tf.eye(to_numpy(ns)[0], n_univ, dtype=U.dtype)
+                U = tf.concat((eye, U[to_numpy(ns)[0]:]), axis=0)
+            if outlier_thresh > 0:
+                norm = tf.reduce_sum(U, axis=1, keepdims=True)
+                U = tf.where(norm > outlier_thresh, U, tf.zeros_like(U))
+            if tf.norm(UUt - lastUUt) < converge_thresh:
+                break
+        if sinkhorn_tau <= min_tau:
+            break
+        sinkhorn_tau *= sk_gamma
+    return U
+
+
+class PCA_GM_Net:
+    def __init__(self, in_channel, hidden_channel, out_channel, num_layers, cross_iter_num=-1):
+        self.gnn_layer = num_layers
+        self.dict = {}
+        for i in range(self.gnn_layer):
+            if i == 0:
+                gnn_layer = Siamese_Gconv(in_channel, hidden_channel)
+            elif 0 < i < self.gnn_layer - 1:
+                gnn_layer = Siamese_Gconv(hidden_channel, hidden_channel)
+            else:
+                gnn_layer = Siamese_Gconv(hidden_channel, out_channel)
+                self.dict[f'affinity_{i}'] = WeightedInnerProdAffinity(out_channel)
+            self.dict[f'gnn_layer_{i}'] = gnn_layer
+            if i == self.gnn_layer - 2:
+                self.dict[f'cross_graph_{i}'] = Linear(hidden_channel * 2, hidden_channel)
+                if cross_iter_num <= 0:
+                    self.dict[f'affinity_{i}'] = WeightedInnerProdAffinity(hidden_channel)
+
+    def forward(self, feat1, feat2, A1, A2, n1, n2, cross_iter_num, sk_max_iter, sk_tau):
+        sinkhorn_func = functools.partial(sinkhorn, dummy_row=False, max_iter=sk_max_iter, tau=sk_tau, batched_operation=False)
+        emb1, emb2 = feat1, feat2
+        if cross_iter_num <= 0:
+            for i in range(self.gnn_layer):
+                emb1, emb2 = self.dict[f'gnn_layer_{i}'].forward([A1, emb1], [A2, emb2])
+                if i == self.gnn_layer - 2:
+                    s = sinkhorn_func(self.dict[f'affinity_{i}'].forward(emb1, emb2), n1, n2)
+                    emb1 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb1, tf.matmul(s, emb2)), axis=-1))
+                    emb2 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb2, tf.matmul(tf.transpose(s, perm=[0, 2, 1]), emb1)), axis=-1))
+            s = sinkhorn_func(self.dict[f'affinity_{self.gnn_layer - 1}'].forward(emb1, emb2), n1, n2)
+        else:
+            for i in range(self.gnn_layer - 1):
+                emb1, emb2 = self.dict[f'gnn_layer_{i}'].forward([A1, emb1], [A2, emb2])
+            emb1_0, emb2_0 = emb1, emb2
+            s = tf.zeros((emb1.shape[0], emb1.shape[1], emb2.shape[1]), dtype=emb1.dtype)
+            for _ in range(cross_iter_num):
+                i = self.gnn_layer - 2
+                emb1 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb1_0, tf.matmul(s, emb2_0)), axis=-1))
+                emb2 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb2_0, tf.matmul(tf.transpose(s, perm=[0, 2, 1]), emb1_0)), axis=-1))
+                i = self.gnn_layer - 1
+                emb1, emb2 = self.dict[f'gnn_layer_{i}'].forward([A1, emb1], [A2, emb2])
+                s = sinkhorn_func(self.dict[f'affinity_{i}'].forward(emb1, emb2), n1, n2)
+        return s
+
+
+pca_gm_pretrain_path = {
+    'voc': (['https://huggingface.co/heatingma/pygmtools/resolve/main/pca_gm_voc_numpy.npy',
+             'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1En_9f5Zi5rSsS-JTIce7B1BV6ijGEAPd',
+             'https://www.dropbox.com/s/x79ib1em4cgddqp/pca_gm_voc_numpy.npy?dl=1'], 'd85f97498157d723793b8fc1501841ce'),
+    'willow': (['https://huggingface.co/heatingma/pygmtools/resolve/main/pca_gm_willow_numpy.npy',
+                'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1LAnK6ASYu0CO1fEe6WpvMbt5vskuvwLo',
+                'https://www.dropbox.com/s/2vo4wpd9467bl5r/pca_gm_willow_numpy.npy?dl=1'], 'c32f7c8a7a6978619b8fdbb6ad5b505f'),
+    'voc-all': (['https://huggingface.co/heatingma/pygmtools/resolve/main/pca_gm_voc-all_numpy.npy',
+                 'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1c_aw4wxEBuY7JFC4Rt8rlcise777n189',
+                 'https://www.dropbox.com/s/6yunsy3gqxfvdyu/pca_gm_voc-all_numpy.npy?dl=1'], '0e2725b3ac51f87f0303bbcfaae5df80')
+}
+
+
+def pca_gm(feat1, feat2, A1, A2, n1, n2, in_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau,
+           network, pretrain):
+    if network is None:
+        network = PCA_GM_Net(in_channel, hidden_channel, out_channel, num_layers)
+        if pretrain:
+            if pretrain not in pca_gm_pretrain_path:
+                raise ValueError(f'Unknown pretrain tag. Available tags: {pca_gm_pretrain_path.keys()}')
+            filename = pygmtools.utils.download(f'pca_gm_{pretrain}_numpy.npy', *pca_gm_pretrain_path[pretrain])
+            params = np.load(filename, allow_pickle=True).item()
+            for i in range(network.gnn_layer):
+                gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
+                gnn_layer.a_fc.weight.assign(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
+                gnn_layer.a_fc.bias.assign(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
+                gnn_layer.u_fc.weight.assign(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
+                gnn_layer.u_fc.bias.assign(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
+                if i == network.gnn_layer - 2:
+                    network.dict[f'affinity_{i}'].A.assign(params[f'affinity_{i}.A'])
+                    network.dict[f'cross_graph_{i}'].weight.assign(params[f'cross_graph_{i}.weight'])
+                    network.dict[f'cross_graph_{i}'].bias.assign(params[f'cross_graph_{i}.bias'])
+            network.dict[f'affinity_{network.gnn_layer - 1}'].A.assign(params[f'affinity_{network.gnn_layer - 1}.A'])
+    if feat1 is None:
+        return None, network
+    batch_size = feat1.shape[0]
+    if n1 is None:
+        n1 = tf.constant([feat1.shape[1]] * batch_size)
+    if n2 is None:
+        n2 = tf.constant([feat2.shape[1]] * batch_size)
+    return network.forward(feat1, feat2, A1, A2, n1, n2, -1, sk_max_iter, sk_tau), network
+
+
+ipca_gm_pretrain_path = {
+    'voc': (['https://huggingface.co/heatingma/pygmtools/resolve/main/ipca_gm_voc_numpy.npy',
+             'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=13g9iBjXZ804bKo6p8wMQe8yNUZBwVGJj',
+             'https://raw.githubusercontent.com/heatingma/pygmtools-pretrained-models/main/numpy_backend/ipca_gm_voc_numpy.npy'], '4479a25558780a4b4c9891b4386659cd'),
+    'willow': (['https://huggingface.co/heatingma/pygmtools/resolve/main/ipca_gm_willow_numpy.npy',
+                'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1vq0FqjPhiSR80cu9jk0qMljkC4gSFvQA',
+                'https://raw.githubusercontent.com/heatingma/pygmtools-pretrained-models/main/numpy_backend/ipca_gm_willow_numpy.npy'], 'ada1df350d45cc877f08e12919993345')
+}
+
+
+def ipca_gm(feat1, feat2, A1, A2, n1, n2, in_channel, hidden_channel, out_channel, num_layers, cross_iter,
+            sk_max_iter, sk_tau, network, pretrain):
+    if network is None:
+        network = PCA_GM_Net(in_channel, hidden_channel, out_channel, num_layers, cross_iter)
+        if pretrain:
+            if pretrain not in ipca_gm_pretrain_path:
+                raise ValueError(f'Unknown pretrain tag. Available tags: {ipca_gm_pretrain_path.keys()}')
+            filename = pygmtools.utils.download(f'ipca_gm_{pretrain}_numpy.npy', *ipca_gm_pretrain_path[pretrain])
+            params = np.load(filename, allow_pickle=True).item()
+            for i in range(network.gnn_layer - 1):
+                gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
+                gnn_layer.a_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
+                gnn_layer.a_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
+                gnn_layer.u_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
+                gnn_layer.u_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
+            i = network.gnn_layer - 2
+            network.dict[f'cross_graph_{i}'].weight = tf.Variable(params[f'cross_graph_{i}.weight'])
+            network.dict[f'cross_graph_{i}'].bias = tf.Variable(params[f'cross_graph_{i}.bias'])
+            i = network.gnn_layer - 1
+            gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
+            gnn_layer.a_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
+            gnn_layer.a_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
+            gnn_layer.u_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
+            gnn_layer.u_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
+            network.dict[f'affinity_{i}'].A = tf.Variable(params[f'affinity_{i}.A'])
+    if feat1 is None:
+        return None, network
+    batch_size = feat1.shape[0]
+    if n1 is None:
+        n1 = tf.constant([feat1.shape[1]] * batch_size)
+    if n2 is None:
+        n2 = tf.constant([feat2.shape[1]] * batch_size)
+    return network.forward(feat1, feat2, A1, A2, n1, n2, cross_iter, sk_max_iter, sk_tau), network
+
+
+class CIE_Net:
+    def __init__(self, in_node_channel, in_edge_channel, hidden_channel, out_channel, num_layers):
+        self.gnn_layer = num_layers
+        self.dict = {}
+        for i in range(num_layers):
+            if i == 0:
+                gnn = Siamese_ChannelIndependentConv(in_node_channel, hidden_channel, in_edge_channel)
+            elif i < num_layers - 1:
+                gnn = Siamese_ChannelIndependentConv(hidden_channel, hidden_channel, hidden_channel)
+            else:
+                gnn = Siamese_ChannelIndependentConv(hidden_channel, out_channel, hidden_channel)
+                self.dict[f'affinity_{i}'] = WeightedInnerProdAffinity(out_channel)
+            self.dict[f'gnn_layer_{i}'] = gnn
+            if i == num_layers - 2:
+                self.dict[f'cross_graph_{i}'] = Linear(hidden_channel * 2, hidden_channel)
+                self.dict[f'affinity_{i}'] = WeightedInnerProdAffinity(hidden_channel)
+
+    def forward(self, feat_node1, feat_node2, A1, A2, feat_edge1, feat_edge2, n1, n2, sk_max_iter, sk_tau):
+        sinkhorn_func = functools.partial(sinkhorn, dummy_row=False, max_iter=sk_max_iter, tau=sk_tau, batched_operation=False)
+        emb1, emb2 = feat_node1, feat_node2
+        emb_edge1, emb_edge2 = feat_edge1, feat_edge2
+        for i in range(self.gnn_layer):
+            emb1, emb2, emb_edge1, emb_edge2 = self.dict[f'gnn_layer_{i}'].forward([A1, emb1, emb_edge1], [A2, emb2, emb_edge2])
+            if i == self.gnn_layer - 2:
+                s = sinkhorn_func(self.dict[f'affinity_{i}'].forward(emb1, emb2), n1, n2)
+                emb1 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb1, tf.matmul(s, emb2)), axis=-1))
+                emb2 = self.dict[f'cross_graph_{i}'].forward(tf.concat((emb2, tf.matmul(tf.transpose(s, perm=[0, 2, 1]), emb1)), axis=-1))
+        return sinkhorn_func(self.dict[f'affinity_{self.gnn_layer - 1}'].forward(emb1, emb2), n1, n2)
+
+
+cie_pretrain_path = {
+    'voc': (['https://huggingface.co/heatingma/pygmtools/resolve/main/cie_voc_numpy.npy',
+             'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1rP9sJY1fh493LLMWw-7RaeFAMHlbSs2D',
+             'https://www.dropbox.com/s/vxh2e1y5s1jidmk/cie_voc_numpy.npy?dl=1'], '9cbd55fa77d124b95052378643715bae'),
+    'willow': (['https://huggingface.co/heatingma/pygmtools/resolve/main/cie_willow_numpy.npy',
+                'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1cMiXrSQjXZ9lDxeB6194z1-luyslVTR8',
+                'https://www.dropbox.com/s/c3i1nf3ruedm8vk/cie_willow_numpy.npy?dl=1'], 'bd36e1bf314503c1f1482794e1648b18')
+}
+
+
+def cie(feat_node1, feat_node2, A1, A2, feat_edge1, feat_edge2, n1, n2, in_node_channel, in_edge_channel,
+        hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain):
+    if network is None:
+        network = CIE_Net(in_node_channel, in_edge_channel, hidden_channel, out_channel, num_layers)
+        if pretrain:
+            if pretrain not in cie_pretrain_path:
+                raise ValueError(f'Unknown pretrain tag. Available tags: {cie_pretrain_path.keys()}')
+            filename = pygmtools.utils.download(f'cie_{pretrain}_numpy.npy', *cie_pretrain_path[pretrain])
+            params = np.load(filename, allow_pickle=True).item()
+            for i in range(network.gnn_layer):
+                gnn = network.dict[f'gnn_layer_{i}'].gconv
+                gnn.node_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.node_fc.weight'])
+                gnn.node_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.node_fc.bias'])
+                gnn.node_sfc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.node_sfc.weight'])
+                gnn.node_sfc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.node_sfc.bias'])
+                gnn.edge_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.edge_fc.weight'])
+                gnn.edge_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.edge_fc.bias'])
+                if i == network.gnn_layer - 2:
+                    network.dict[f'affinity_{i}'].A = tf.Variable(params[f'affinity_{i}.A'])
+                    network.dict[f'cross_graph_{i}'].weight = tf.Variable(params[f'cross_graph_{i}.weight'])
+                    network.dict[f'cross_graph_{i}'].bias = tf.Variable(params[f'cross_graph_{i}.bias'])
+            network.dict[f'affinity_{network.gnn_layer - 1}'].A = tf.Variable(params[f'affinity_{network.gnn_layer - 1}.A'])
+    if feat_node1 is None:
+        return None, network
+    batch_size = feat_node1.shape[0]
+    if n1 is None:
+        n1 = tf.constant([feat_node1.shape[1]] * batch_size)
+    if n2 is None:
+        n2 = tf.constant([feat_node2.shape[1]] * batch_size)
+    return network.forward(feat_node1, feat_node2, A1, A2, feat_edge1, feat_edge2, n1, n2, sk_max_iter, sk_tau), network
+
+
+class NGM_Net:
+    def __init__(self, gnn_channels, sk_emb):
+        self.gnn_layer = len(gnn_channels)
+        self.dict = {}
+        for i in range(self.gnn_layer):
+            if i == 0:
+                gnn = NGMConvLayer(1, 1, gnn_channels[i] + sk_emb, gnn_channels[i], sk_channel=sk_emb)
+            else:
+                gnn = NGMConvLayer(gnn_channels[i - 1] + sk_emb, gnn_channels[i - 1], gnn_channels[i] + sk_emb,
+                                   gnn_channels[i], sk_channel=sk_emb)
+            self.dict[f'gnn_layer_{i}'] = gnn
+        self.classifier = Linear(gnn_channels[-1] + sk_emb, 1)
+
+    def forward(self, K, n1, n2, n1max, n2max, v0, sk_max_iter, sk_tau):
+        sinkhorn_func = functools.partial(sinkhorn, dummy_row=False, max_iter=sk_max_iter, tau=sk_tau, batched_operation=False)
+        emb = v0
+        A = tf.cast(K != 0, K.dtype)
+        emb_K = tf.expand_dims(K, axis=-1)
+        for i in range(self.gnn_layer):
+            emb_K, emb = self.dict[f'gnn_layer_{i}'].forward(A, emb_K, emb, n1, n2, sk_func=sinkhorn_func)
+        v = self.classifier.forward(emb)
+        s = tf.transpose(tf.reshape(v, (v.shape[0], n2max, -1)), perm=[0, 2, 1])
+        return sinkhorn_func(s, n1, n2, dummy_row=True)
+
+
+ngm_pretrain_path = {
+    'voc': (['https://huggingface.co/heatingma/pygmtools/resolve/main/ngm_voc_numpy.npy',
+             'https://raw.githubusercontent.com/heatingma/pygmtools-pretrained-models/main/numpy_backend/ngm_voc_numpy.npy',
+             'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1LY93fLCjH5vDcWsjZxGPmXmrYMF8HZIR'], '19cd48afab71b3277d2062624934702c'),
+    'willow': (['https://huggingface.co/heatingma/pygmtools/resolve/main/ngm_willow_numpy.npy',
+                'https://raw.githubusercontent.com/heatingma/pygmtools-pretrained-models/main/numpy_backend/ngm_willow_numpy.npy',
+                'https://drive.google.com/u/0/uc?export=download&confirm=Z-AR&id=1iD8FHqahRsVV_H6o3ByB6nwBHU8sEgnt'], '31968e30c399845f34d80733d0118b8b')
+}
+
+
+def ngm(K, n1, n2, n1max, n2max, x0, gnn_channels, sk_emb, sk_max_iter, sk_tau, network, return_network, pretrain):
+    if network is None:
+        network = NGM_Net(gnn_channels, sk_emb)
+        if pretrain:
+            if pretrain not in ngm_pretrain_path:
+                raise ValueError(f'Unknown pretrain tag. Available tags: {ngm_pretrain_path.keys()}')
+            try:
+                filename = pygmtools.utils.download(f'ngm_{pretrain}_numpy.npy', *ngm_pretrain_path[pretrain])
+            except Exception:
+                filename = os.path.dirname(__file__) + f'/temp/ngm_{pretrain}_numpy.npy'
+            params = np.load(filename, allow_pickle=True).item()
+            for i in range(network.gnn_layer):
+                gnn = network.dict[f'gnn_layer_{i}']
+                gnn.classifier.weight = tf.Variable(params[f'gnn_layer_{i}.classifier.weight'])
+                gnn.classifier.bias = tf.Variable(params[f'gnn_layer_{i}.classifier.bias'])
+                gnn.n_func.getitem(0).weight = tf.Variable(params[f'gnn_layer_{i}.n_func.0.weight'])
+                gnn.n_func.getitem(0).bias = tf.Variable(params[f'gnn_layer_{i}.n_func.0.bias'])
+                gnn.n_func.getitem(2).weight = tf.Variable(params[f'gnn_layer_{i}.n_func.2.weight'])
+                gnn.n_func.getitem(2).bias = tf.Variable(params[f'gnn_layer_{i}.n_func.2.bias'])
+                gnn.n_self_func.getitem(0).weight = tf.Variable(params[f'gnn_layer_{i}.n_self_func.0.weight'])
+                gnn.n_self_func.getitem(0).bias = tf.Variable(params[f'gnn_layer_{i}.n_self_func.0.bias'])
+                gnn.n_self_func.getitem(2).weight = tf.Variable(params[f'gnn_layer_{i}.n_self_func.2.weight'])
+                gnn.n_self_func.getitem(2).bias = tf.Variable(params[f'gnn_layer_{i}.n_self_func.2.bias'])
+            network.classifier.weight = tf.Variable(params['classifier.weight'])
+            network.classifier.bias = tf.Variable(params['classifier.bias'])
+    if K is None:
+        return None, network
+    batch_num, n1, n2, n1max, n2max, n1n2, v0 = _check_and_init_gm(K, n1, n2, n1max, n2max, x0)
+    v0 = v0 / tf.reduce_mean(v0)
+    return network.forward(K, n1, n2, n1max, n2max, v0, sk_max_iter, sk_tau), network
 
 
 #############################################

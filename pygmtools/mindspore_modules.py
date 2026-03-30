@@ -3,29 +3,17 @@
 
 import math
 import numpy as np
-import tensorflow as tf
-
-
-def _uniform(shape, a, b, dtype=tf.float32):
-    return tf.Variable(np.random.uniform(a, b, shape).astype(dtype.as_numpy_dtype))
-
-
-def _kaiming_uniform(shape, a=0., mode='fan_in', dtype=tf.float32):
-    gain = math.sqrt(2 / (a * a + 1))
-    fan_in = shape[1]
-    fan_out = shape[0]
-    fan_mode = fan_in if mode == 'fan_in' else fan_out
-    bound = gain * math.sqrt(3 / fan_mode)
-    return _uniform(shape, -bound, bound, dtype)
+import mindspore
+import mindspore.ops as ops
 
 
 def relu(x):
-    return tf.nn.relu(x)
+    return ops.relu(x)
 
 
 def normalize_abs(array, axis):
-    denom = tf.reduce_sum(tf.abs(array), axis=axis, keepdims=True)
-    return tf.math.divide_no_nan(array, denom)
+    denom = ops.sum(ops.abs(array), axis=axis, keepdims=True)
+    return ops.div_no_nan(array, denom)
 
 
 class WeightedInnerProdAffinity:
@@ -33,26 +21,21 @@ class WeightedInnerProdAffinity:
         self.d = d
         stdv = 1. / math.sqrt(d)
         init = np.random.uniform(-stdv, stdv, (d, d)).astype(np.float32) + np.eye(d, dtype=np.float32)
-        self.A = tf.Variable(init)
+        self.A = mindspore.Tensor(init)
 
     def forward(self, X, Y):
-        M = tf.matmul(X, self.A)
-        return tf.matmul(M, Y, transpose_b=True)
+        return ops.matmul(ops.matmul(X, self.A), Y.swapaxes(1, 2))
 
 
 class Linear:
     def __init__(self, in_features, out_features, bias=True):
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = _kaiming_uniform((out_features, in_features), a=math.sqrt(5))
-        if bias:
-            bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
-            self.bias = _uniform((out_features,), -bound, bound)
-        else:
-            self.bias = None
+        bound = 1 / math.sqrt(in_features) if in_features > 0 else 0
+        weight = np.random.uniform(-bound, bound, (out_features, in_features)).astype(np.float32)
+        self.weight = mindspore.Tensor(weight)
+        self.bias = mindspore.Tensor(np.random.uniform(-bound, bound, (out_features,)).astype(np.float32)) if bias else None
 
     def forward(self, x):
-        y = tf.matmul(x, self.weight, transpose_b=True)
+        y = ops.matmul(x, self.weight.swapaxes(-1, -2))
         if self.bias is not None:
             y = y + self.bias
         return y
@@ -84,9 +67,7 @@ class Gconv:
     def forward(self, A, x, norm=True):
         if norm:
             A = normalize_abs(A, axis=-2)
-        ax = relu(self.a_fc.forward(x))
-        ux = relu(self.u_fc.forward(x))
-        return tf.matmul(A, ax) + ux
+        return ops.matmul(A, relu(self.a_fc.forward(x))) + relu(self.u_fc.forward(x))
 
 
 class ChannelIndependentConv:
@@ -103,9 +84,7 @@ class ChannelIndependentConv:
         node_x = self.node_fc.forward(emb_node)
         node_sx = self.node_sfc.forward(emb_node)
         edge_x = self.edge_fc.forward(emb_edge)
-
-        A = tf.expand_dims(A, axis=-1) * edge_x
-        node_x = tf.einsum('bijf,bjf->bif', A, node_x)
+        node_x = ops.einsum('bijf,bjf->bif', ops.expand_dims(A, -1) * edge_x, node_x)
         return relu(node_x) + relu(node_sx), relu(edge_x)
 
 
@@ -139,9 +118,6 @@ class Siamese_ChannelIndependentConv:
 
 class NGMConvLayer:
     def __init__(self, in_node_features, in_edge_features, out_node_features, out_edge_features, sk_channel=0):
-        self.in_nfeat = in_node_features
-        self.in_efeat = in_edge_features
-        self.out_efeat = out_edge_features
         self.sk_channel = sk_channel
         assert out_node_features == out_edge_features + sk_channel
         if sk_channel > 0:
@@ -151,13 +127,13 @@ class NGMConvLayer:
             self.out_nfeat = out_node_features
             self.classifier = None
         self.n_func = Sequential(
-            Linear(self.in_nfeat, self.out_nfeat),
+            Linear(in_node_features, self.out_nfeat),
             ReLU(),
             Linear(self.out_nfeat, self.out_nfeat),
             ReLU(),
         )
         self.n_self_func = Sequential(
-            Linear(self.in_nfeat, self.out_nfeat),
+            Linear(in_node_features, self.out_nfeat),
             ReLU(),
             Linear(self.out_nfeat, self.out_nfeat),
             ReLU(),
@@ -168,20 +144,15 @@ class NGMConvLayer:
         if norm:
             A = normalize_abs(A, axis=2)
         x1 = self.n_func.forward(x)
-        x2 = tf.einsum('bijd,bjd->bid', tf.expand_dims(A, axis=-1) * W_new, x1)
-        x2 = x2 + self.n_self_func.forward(x)
+        x2 = ops.einsum('bijd,bjd->bid', ops.expand_dims(A, -1) * W_new, x1) + self.n_self_func.forward(x)
         if self.classifier is None:
             return W_new, x2
-
         x3 = self.classifier.forward(x2)
-        n1_rep = tf.repeat(n1, self.sk_channel)
-        n2_rep = tf.repeat(n2, self.sk_channel)
-        max_n1 = tf.reduce_max(n1)
-        max_n2 = tf.reduce_max(n2)
-        x4 = tf.transpose(x3, perm=[0, 2, 1])
-        x4 = tf.reshape(x4, (tf.shape(x)[0] * self.sk_channel, max_n2, max_n1))
-        x4 = tf.transpose(x4, perm=[0, 2, 1])
-        x5 = tf.transpose(sk_func(x4, n1_rep, n2_rep, dummy_row=True), perm=[0, 2, 1])
-        x6 = tf.reshape(x5, (tf.shape(x)[0], self.sk_channel, max_n1 * max_n2))
-        x6 = tf.transpose(x6, perm=[0, 2, 1])
-        return W_new, tf.concat((x2, x6), axis=-1)
+        n1_rep = ops.tile(n1, (self.sk_channel,))
+        n2_rep = ops.tile(n2, (self.sk_channel,))
+        max_n1 = n1.max()
+        max_n2 = n2.max()
+        x4 = x3.swapaxes(1, 2).reshape((-1, max_n2, max_n1)).swapaxes(1, 2)
+        x5 = sk_func(x4, n1_rep, n2_rep, dummy_row=True).swapaxes(1, 2)
+        x6 = x5.reshape((x.shape[0], self.sk_channel, max_n1 * max_n2)).swapaxes(1, 2)
+        return W_new, ops.concat((x2, x6), axis=-1)
