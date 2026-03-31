@@ -9,6 +9,7 @@ import itertools
 
 import inspect
 import functools
+import pygmtools
 from pygmtools.mindspore_modules import WeightedInnerProdAffinity, Linear, Siamese_Gconv, \
     Siamese_ChannelIndependentConv, NGMConvLayer
 _max_signature = inspect.signature(mindspore.ops.max)
