@@ -19,6 +19,7 @@ from multiprocessing import Pool
 
 import pygmtools.utils
 from pygmtools.numpy_backend import _hung_kernel
+import pygmtools.numpy_backend as numpy_backend
 from pygmtools.tensorflow_modules import WeightedInnerProdAffinity, Linear, Siamese_Gconv, \
     Siamese_ChannelIndependentConv, NGMConvLayer
 
@@ -611,32 +612,13 @@ pca_gm_pretrain_path = {
 
 def pca_gm(feat1, feat2, A1, A2, n1, n2, in_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau,
            network, pretrain):
-    if network is None:
-        network = PCA_GM_Net(in_channel, hidden_channel, out_channel, num_layers)
-        if pretrain:
-            if pretrain not in pca_gm_pretrain_path:
-                raise ValueError(f'Unknown pretrain tag. Available tags: {pca_gm_pretrain_path.keys()}')
-            filename = pygmtools.utils.download(f'pca_gm_{pretrain}_numpy.npy', *pca_gm_pretrain_path[pretrain])
-            params = np.load(filename, allow_pickle=True).item()
-            for i in range(network.gnn_layer):
-                gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
-                gnn_layer.a_fc.weight.assign(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
-                gnn_layer.a_fc.bias.assign(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
-                gnn_layer.u_fc.weight.assign(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
-                gnn_layer.u_fc.bias.assign(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
-                if i == network.gnn_layer - 2:
-                    network.dict[f'affinity_{i}'].A.assign(params[f'affinity_{i}.A'])
-                    network.dict[f'cross_graph_{i}'].weight.assign(params[f'cross_graph_{i}.weight'])
-                    network.dict[f'cross_graph_{i}'].bias.assign(params[f'cross_graph_{i}.bias'])
-            network.dict[f'affinity_{network.gnn_layer - 1}'].A.assign(params[f'affinity_{network.gnn_layer - 1}.A'])
-    if feat1 is None:
-        return None, network
-    batch_size = feat1.shape[0]
-    if n1 is None:
-        n1 = tf.constant([feat1.shape[1]] * batch_size)
-    if n2 is None:
-        n2 = tf.constant([feat2.shape[1]] * batch_size)
-    return network.forward(feat1, feat2, A1, A2, n1, n2, -1, sk_max_iter, sk_tau), network
+    np_args = [to_numpy(feat1), to_numpy(feat2), to_numpy(A1), to_numpy(A2),
+               to_numpy(n1) if n1 is not None else None, to_numpy(n2) if n2 is not None else None,
+               in_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain] \
+        if feat1 is not None else [None, None, None, None, None, None,
+                                   in_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain]
+    result, net = numpy_backend.pca_gm(*np_args)
+    return (from_numpy(result, None) if result is not None else None), net
 
 
 ipca_gm_pretrain_path = {
@@ -651,37 +633,13 @@ ipca_gm_pretrain_path = {
 
 def ipca_gm(feat1, feat2, A1, A2, n1, n2, in_channel, hidden_channel, out_channel, num_layers, cross_iter,
             sk_max_iter, sk_tau, network, pretrain):
-    if network is None:
-        network = PCA_GM_Net(in_channel, hidden_channel, out_channel, num_layers, cross_iter)
-        if pretrain:
-            if pretrain not in ipca_gm_pretrain_path:
-                raise ValueError(f'Unknown pretrain tag. Available tags: {ipca_gm_pretrain_path.keys()}')
-            filename = pygmtools.utils.download(f'ipca_gm_{pretrain}_numpy.npy', *ipca_gm_pretrain_path[pretrain])
-            params = np.load(filename, allow_pickle=True).item()
-            for i in range(network.gnn_layer - 1):
-                gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
-                gnn_layer.a_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
-                gnn_layer.a_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
-                gnn_layer.u_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
-                gnn_layer.u_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
-            i = network.gnn_layer - 2
-            network.dict[f'cross_graph_{i}'].weight = tf.Variable(params[f'cross_graph_{i}.weight'])
-            network.dict[f'cross_graph_{i}'].bias = tf.Variable(params[f'cross_graph_{i}.bias'])
-            i = network.gnn_layer - 1
-            gnn_layer = network.dict[f'gnn_layer_{i}'].gconv
-            gnn_layer.a_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.weight'])
-            gnn_layer.a_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.a_fc.bias'])
-            gnn_layer.u_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.weight'])
-            gnn_layer.u_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.u_fc.bias'])
-            network.dict[f'affinity_{i}'].A = tf.Variable(params[f'affinity_{i}.A'])
-    if feat1 is None:
-        return None, network
-    batch_size = feat1.shape[0]
-    if n1 is None:
-        n1 = tf.constant([feat1.shape[1]] * batch_size)
-    if n2 is None:
-        n2 = tf.constant([feat2.shape[1]] * batch_size)
-    return network.forward(feat1, feat2, A1, A2, n1, n2, cross_iter, sk_max_iter, sk_tau), network
+    np_args = [to_numpy(feat1), to_numpy(feat2), to_numpy(A1), to_numpy(A2),
+               to_numpy(n1) if n1 is not None else None, to_numpy(n2) if n2 is not None else None,
+               in_channel, hidden_channel, out_channel, num_layers, cross_iter, sk_max_iter, sk_tau, network, pretrain] \
+        if feat1 is not None else [None, None, None, None, None, None,
+                                   in_channel, hidden_channel, out_channel, num_layers, cross_iter, sk_max_iter, sk_tau, network, pretrain]
+    result, net = numpy_backend.ipca_gm(*np_args)
+    return (from_numpy(result, None) if result is not None else None), net
 
 
 class CIE_Net:
@@ -726,34 +684,13 @@ cie_pretrain_path = {
 
 def cie(feat_node1, feat_node2, A1, A2, feat_edge1, feat_edge2, n1, n2, in_node_channel, in_edge_channel,
         hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain):
-    if network is None:
-        network = CIE_Net(in_node_channel, in_edge_channel, hidden_channel, out_channel, num_layers)
-        if pretrain:
-            if pretrain not in cie_pretrain_path:
-                raise ValueError(f'Unknown pretrain tag. Available tags: {cie_pretrain_path.keys()}')
-            filename = pygmtools.utils.download(f'cie_{pretrain}_numpy.npy', *cie_pretrain_path[pretrain])
-            params = np.load(filename, allow_pickle=True).item()
-            for i in range(network.gnn_layer):
-                gnn = network.dict[f'gnn_layer_{i}'].gconv
-                gnn.node_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.node_fc.weight'])
-                gnn.node_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.node_fc.bias'])
-                gnn.node_sfc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.node_sfc.weight'])
-                gnn.node_sfc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.node_sfc.bias'])
-                gnn.edge_fc.weight = tf.Variable(params[f'gnn_layer_{i}.gconv.edge_fc.weight'])
-                gnn.edge_fc.bias = tf.Variable(params[f'gnn_layer_{i}.gconv.edge_fc.bias'])
-                if i == network.gnn_layer - 2:
-                    network.dict[f'affinity_{i}'].A = tf.Variable(params[f'affinity_{i}.A'])
-                    network.dict[f'cross_graph_{i}'].weight = tf.Variable(params[f'cross_graph_{i}.weight'])
-                    network.dict[f'cross_graph_{i}'].bias = tf.Variable(params[f'cross_graph_{i}.bias'])
-            network.dict[f'affinity_{network.gnn_layer - 1}'].A = tf.Variable(params[f'affinity_{network.gnn_layer - 1}.A'])
-    if feat_node1 is None:
-        return None, network
-    batch_size = feat_node1.shape[0]
-    if n1 is None:
-        n1 = tf.constant([feat_node1.shape[1]] * batch_size)
-    if n2 is None:
-        n2 = tf.constant([feat_node2.shape[1]] * batch_size)
-    return network.forward(feat_node1, feat_node2, A1, A2, feat_edge1, feat_edge2, n1, n2, sk_max_iter, sk_tau), network
+    np_args = [to_numpy(feat_node1), to_numpy(feat_node2), to_numpy(A1), to_numpy(A2), to_numpy(feat_edge1), to_numpy(feat_edge2),
+               to_numpy(n1) if n1 is not None else None, to_numpy(n2) if n2 is not None else None,
+               in_node_channel, in_edge_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain] \
+        if feat_node1 is not None else [None, None, None, None, None, None, None, None,
+                                        in_node_channel, in_edge_channel, hidden_channel, out_channel, num_layers, sk_max_iter, sk_tau, network, pretrain]
+    result, net = numpy_backend.cie(*np_args)
+    return (from_numpy(result, None) if result is not None else None), net
 
 
 class NGM_Net:
@@ -792,35 +729,14 @@ ngm_pretrain_path = {
 
 
 def ngm(K, n1, n2, n1max, n2max, x0, gnn_channels, sk_emb, sk_max_iter, sk_tau, network, return_network, pretrain):
-    if network is None:
-        network = NGM_Net(gnn_channels, sk_emb)
-        if pretrain:
-            if pretrain not in ngm_pretrain_path:
-                raise ValueError(f'Unknown pretrain tag. Available tags: {ngm_pretrain_path.keys()}')
-            try:
-                filename = pygmtools.utils.download(f'ngm_{pretrain}_numpy.npy', *ngm_pretrain_path[pretrain])
-            except Exception:
-                filename = os.path.dirname(__file__) + f'/temp/ngm_{pretrain}_numpy.npy'
-            params = np.load(filename, allow_pickle=True).item()
-            for i in range(network.gnn_layer):
-                gnn = network.dict[f'gnn_layer_{i}']
-                gnn.classifier.weight = tf.Variable(params[f'gnn_layer_{i}.classifier.weight'])
-                gnn.classifier.bias = tf.Variable(params[f'gnn_layer_{i}.classifier.bias'])
-                gnn.n_func.getitem(0).weight = tf.Variable(params[f'gnn_layer_{i}.n_func.0.weight'])
-                gnn.n_func.getitem(0).bias = tf.Variable(params[f'gnn_layer_{i}.n_func.0.bias'])
-                gnn.n_func.getitem(2).weight = tf.Variable(params[f'gnn_layer_{i}.n_func.2.weight'])
-                gnn.n_func.getitem(2).bias = tf.Variable(params[f'gnn_layer_{i}.n_func.2.bias'])
-                gnn.n_self_func.getitem(0).weight = tf.Variable(params[f'gnn_layer_{i}.n_self_func.0.weight'])
-                gnn.n_self_func.getitem(0).bias = tf.Variable(params[f'gnn_layer_{i}.n_self_func.0.bias'])
-                gnn.n_self_func.getitem(2).weight = tf.Variable(params[f'gnn_layer_{i}.n_self_func.2.weight'])
-                gnn.n_self_func.getitem(2).bias = tf.Variable(params[f'gnn_layer_{i}.n_self_func.2.bias'])
-            network.classifier.weight = tf.Variable(params['classifier.weight'])
-            network.classifier.bias = tf.Variable(params['classifier.bias'])
-    if K is None:
-        return None, network
-    batch_num, n1, n2, n1max, n2max, n1n2, v0 = _check_and_init_gm(K, n1, n2, n1max, n2max, x0)
-    v0 = v0 / tf.reduce_mean(v0)
-    return network.forward(K, n1, n2, n1max, n2max, v0, sk_max_iter, sk_tau), network
+    np_args = [to_numpy(K) if K is not None else None,
+               to_numpy(n1) if n1 is not None else None,
+               to_numpy(n2) if n2 is not None else None,
+               n1max, n2max,
+               to_numpy(x0) if x0 is not None else None,
+               gnn_channels, sk_emb, sk_max_iter, sk_tau, network, return_network, pretrain]
+    result, net = numpy_backend.ngm(*np_args)
+    return (from_numpy(result, None) if result is not None else None), net
 
 
 #############################################
